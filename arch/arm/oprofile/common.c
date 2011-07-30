@@ -297,41 +297,44 @@ static int report_trace(struct stackframe *frame, void *d)
 	return *depth == 0;
 }
 
-/*
- * The registers we're interested in are at the end of the variable
- * length saved register structure. The fp points at the end of this
- * structure so the address of this struct is:
- * (struct frame_tail *)(xxx->fp)-1
- */
-struct frame_tail {
-	struct frame_tail *fp;
-	unsigned long sp;
-	unsigned long lr;
-} __attribute__((packed));
-
-static struct frame_tail* user_backtrace(struct frame_tail *tail)
+static int user_valid_lr(struct mm_struct *mm, unsigned long lr)
 {
-	struct frame_tail buftail[2];
+	struct vm_area_struct *vma;
+	unsigned long bl;
 
-	/* Also check accessibility of one struct frame_tail beyond */
-	if (!access_ok(VERIFY_READ, tail, sizeof(buftail)))
-		return NULL;
-	if (__copy_from_user_inatomic(buftail, tail, sizeof(buftail)))
-		return NULL;
+	/* If not THUMB mode, must be ARM mode */
+	if (!(lr & 1) && (lr & 3))
+		return 0;
 
-	oprofile_add_trace(buftail[0].lr);
+	vma = find_vma(mm, lr);
+	/* Test whether the address is valid and executable */
+	if (!vma ||
+	  vma->vm_start >= lr ||
+	  !(vma->vm_flags & VM_EXEC) ||
+	  !access_ok(VERIFY_READ, (lr & ~1) - sizeof(bl), sizeof(bl)))
+		return 0;
 
-	/* frame pointers should strictly progress back up the stack
-	 * (towards higher addresses) */
-	if (tail >= buftail[0].fp)
-		return NULL;
+	/* Test whether the instruction before *lr is a branch */
+	if (__copy_from_user_inatomic(&bl,
+	      (void*)((lr & ~1) - sizeof(bl)), sizeof(bl)))
+		return 0;
 
-	return buftail[0].fp-1;
+	return
+	  ((lr & 1) && ( /* THUMB mode */
+	    (bl & 0xD000F800) == 0xD000F000 ||
+	    (bl & 0xD001F800) == 0xC000F000 ||
+	    (bl & 0xFF800000) == 0x47800000)) ||
+	  (!(lr & 1) && ( /* ARM mode */
+	    (bl & 0x0F000000) == 0x0B000000 ||
+	    (bl & 0xFE000000) == 0xFA000000 ||
+	    (bl & 0x0FF000F0) == 0x01200030));
 }
 
 static void arm_backtrace(struct pt_regs * const regs, unsigned int depth)
 {
-	struct frame_tail *tail = ((struct frame_tail *) regs->ARM_fp) - 1;
+	struct mm_struct *mm;
+	unsigned long vmlow, sp, lr, spbuf[0x40];
+	unsigned int limit = 0x40, spbuflen = 0, spbufidx = 0;
 
 	if (!user_mode(regs)) {
 		struct stackframe frame;
@@ -343,8 +346,34 @@ static void arm_backtrace(struct pt_regs * const regs, unsigned int depth)
 		return;
 	}
 
-	while (depth-- && tail && !((unsigned long) tail & 3))
-		tail = user_backtrace(tail);
+	mm = current->mm;
+	if (!mm || !mm->mmap)
+		return;
+
+	vmlow = mm->mmap->vm_start;
+	sp = regs->ARM_sp;
+	lr = regs->ARM_lr;
+
+	for (; limit && depth; --limit) {
+		if (lr >= vmlow && /* sanity check */
+		    user_valid_lr(mm, lr)) {
+			oprofile_add_trace(lr);
+			limit = 0x40;
+			--depth;
+		}
+		if (spbufidx * sizeof(spbuf[0]) >= spbuflen) {
+			if (!access_ok(VERIFY_READ, sp, sizeof(spbuf)))
+				break;
+
+			spbufidx = 0;
+			spbuflen = sizeof(spbuf) - __copy_from_user_inatomic(
+			  spbuf, (void*)sp, sizeof(spbuf));
+			if (!spbuflen)
+				break;
+			sp += spbuflen;
+		}
+		lr = spbuf[spbufidx++];
+	}
 }
 
 int __init oprofile_arch_init(struct oprofile_operations *ops)
